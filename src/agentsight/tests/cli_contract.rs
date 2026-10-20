@@ -896,3 +896,354 @@ fn interruption_stats_scopes_to_the_requested_agent() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Insert one interruption per (type, severity) for one session and one
+/// conversation, so a per-id filter changes the returned rows.
+fn per_id_interruption_fixture(dir: &std::path::Path, events: &[(&str, &str, &str)]) -> PathBuf {
+    use agentsight::interruption::{InterruptionEvent, InterruptionType, Severity};
+
+    let db = dir.join("interruption_events.db");
+    let store = agentsight::storage::sqlite::InterruptionStore::new_with_path(&db)
+        .expect("create interruption store");
+    for (index, (itype, severity, agent)) in events.iter().enumerate() {
+        let itype = InterruptionType::from_str(itype).expect("known interruption type");
+        let severity = match *severity {
+            "critical" => Severity::Critical,
+            "high" => Severity::High,
+            "medium" => Severity::Medium,
+            other => panic!("unknown severity {other}"),
+        };
+        let mut event = InterruptionEvent::new(
+            itype,
+            Some("per-id-session".to_string()),
+            None,
+            Some("per-id-conversation".to_string()),
+            None,
+            Some(4242),
+            Some((*agent).to_string()),
+            now_ns(),
+            None,
+        );
+        event.severity = severity;
+        event.interruption_id = format!("per-id-{index}");
+        store.insert(&event).expect("insert interruption event");
+    }
+    drop(store);
+    db
+}
+
+/// `session` and `conversation` rejected `--type` / `--severity` even though
+/// `list` has both and the store's per-id queries already return the columns
+/// they filter on. Narrowing one session to its critical rows meant dumping
+/// `--json` and filtering by hand. Reverting the wiring (passing `None` for the
+/// two filters) makes the scoped assertions fail.
+#[test]
+fn interruption_session_and_conversation_accept_the_row_filters() {
+    let dir = fixture_dir("interruption_per_id_filters");
+    let db = per_id_interruption_fixture(
+        &dir,
+        &[
+            ("llm_error", "high", "ProbeA"),
+            ("token_limit", "medium", "ProbeB"),
+            ("agent_crash", "critical", "ProbeA"),
+        ],
+    );
+
+    let rows = |subcommand: &str, extra: &[&str]| -> Vec<serde_json::Value> {
+        let mut args = vec![
+            "interruption".to_string(),
+            "--db".to_string(),
+            db.to_str().unwrap().to_string(),
+            subcommand.to_string(),
+            if subcommand == "session" {
+                "per-id-session".to_string()
+            } else {
+                "per-id-conversation".to_string()
+            },
+            "--json".to_string(),
+        ];
+        args.extend(extra.iter().map(|value| (*value).to_string()));
+        let out = agentsight().args(&args).output().expect("run agentsight");
+        assert!(
+            out.status.success(),
+            "{subcommand} {extra:?} must be accepted; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).expect("the view must emit a JSON array")
+    };
+
+    for subcommand in ["session", "conversation"] {
+        // Nothing filtered still prints the id's whole history.
+        assert_eq!(rows(subcommand, &[]).len(), 3, "{subcommand} unfiltered");
+
+        let typed = rows(subcommand, &["--type", "token_limit"]);
+        assert_eq!(typed.len(), 1, "{subcommand} --type: {typed:?}");
+        assert_eq!(typed[0]["interruption_type"], "token_limit");
+
+        let severe = rows(subcommand, &["--severity", "critical"]);
+        assert_eq!(severe.len(), 1, "{subcommand} --severity: {severe:?}");
+        assert_eq!(severe[0]["severity"], "critical");
+
+        // The two filters intersect, and an unmatched value yields nothing
+        // instead of falling back to every row.
+        assert_eq!(
+            rows(
+                subcommand,
+                &["--severity", "critical", "--type", "llm_error"]
+            )
+            .len(),
+            0,
+            "{subcommand} must require every filter to match"
+        );
+        assert_eq!(
+            rows(subcommand, &["--type", "dead_loop"]).len(),
+            0,
+            "{subcommand} must not fall back on an unmatched type"
+        );
+    }
+
+    // A rejected value stays a usage error, the same contract `list` has.
+    for (flag, bad) in [("--type", "not_a_type"), ("--severity", "urgent")] {
+        let out = agentsight()
+            .args([
+                "interruption",
+                "--db",
+                db.to_str().unwrap(),
+                "session",
+                "per-id-session",
+                flag,
+                bad,
+            ])
+            .output()
+            .expect("run agentsight");
+        assert!(
+            !out.status.success(),
+            "session {flag} {bad} must be rejected, not ignored"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A genai database holding two SKILL.md loads of one skill on two different
+/// days inside the same ISO week, so the `--last` window holds both.
+fn skill_loads_on_two_days(dir: &std::path::Path) -> PathBuf {
+    let db = dir.join("genai_events.db");
+    let store = agentsight::storage::sqlite::genai::GenAISqliteStore::new_with_path(
+        &db,
+        agentsight::config::PeriodicStoragePolicy::default(),
+    )
+    .expect("create genai store");
+    drop(store);
+
+    // The two loads must share one ISO week for the weekly-bucket assertion
+    // and differ by calendar day for the daily one, while staying at or below
+    // now so the query window keeps them. Plain `now - 2d / now - 1d`
+    // straddles a week boundary whenever the run lands on a Monday or Tuesday
+    // (the Sunday before a Monday belongs to the previous ISO week), so the
+    // offsets depend on the weekday:
+    //   Mon        -> last Friday / last Saturday (same previous week)
+    //   Tue        -> yesterday / now (this Monday / Tuesday)
+    //   Wed..Sun   -> now-2d / now-1d already sit inside the current week
+    let day_ns = 86_400_000_000_000_i64;
+    let now = now_ns();
+    let now_secs = now / 1_000_000_000;
+    let dow = chrono::Datelike::weekday(
+        &chrono::DateTime::from_timestamp(now_secs, 0)
+            .expect("now is a valid timestamp")
+            .naive_utc(),
+    )
+    .number_from_monday();
+    let (first_ns, second_ns) = if dow == 1 {
+        (now - 3 * day_ns, now - 2 * day_ns)
+    } else if dow == 2 {
+        (now - day_ns, now)
+    } else {
+        (now - 2 * day_ns, now - day_ns)
+    };
+
+    let output_messages =
+        serde_json::to_string(&vec![agentsight::genai::semantic::OutputMessage {
+            role: "assistant".to_string(),
+            parts: vec![agentsight::genai::semantic::MessagePart::ToolCall {
+                id: Some("call-fixture".to_string()),
+                name: "read_file".to_string(),
+                arguments: Some(serde_json::json!({"file_path": "/skills/granularity/SKILL.md"})),
+            }],
+            name: None,
+            finish_reason: None,
+        }])
+        .expect("serialize output messages");
+
+    let conn = rusqlite::Connection::open(&db).expect("open genai fixture");
+    for timestamp_ns in [first_ns, second_ns] {
+        conn.execute(
+            "INSERT INTO genai_events
+             (event_type, session_id, conversation_id, call_id, agent_name, model,
+              output_messages, start_timestamp_ns, event_json)
+             VALUES ('llm_call', 'granularity-session', 'granularity-session', ?1,
+                     'GranularityProbe', 'gpt-4', ?2, ?3, '{}')",
+            rusqlite::params![
+                format!("granularity-call-{timestamp_ns}"),
+                output_messages,
+                timestamp_ns
+            ],
+        )
+        .expect("insert genai event");
+    }
+    db
+}
+
+#[test]
+fn skill_metrics_hotness_accepts_a_day_granularity() {
+    // The API has accepted `granularity=day|week` all along and the dashboard
+    // renders daily buckets, but the CLI never passed it: `MetricOptions`
+    // always kept its weekly default, so `hotness` was the one bucket width a
+    // shell could not ask for. Reverting the flag (dropping it from the
+    // subcommand and keeping the default) fails the day-bucket assertion
+    // below, because two loads on two days then collapse into one weekly row.
+    let dir = fixture_dir("skill_hotness_granularity");
+    let db = skill_loads_on_two_days(&dir);
+
+    let bucket_labels = |args: &[&str]| -> Vec<String> {
+        let mut full = vec![
+            "skill-metrics".to_string(),
+            "hotness".to_string(),
+            "--db".to_string(),
+            db.to_str().unwrap().to_string(),
+            "--json".to_string(),
+        ];
+        full.extend(args.iter().map(|arg| arg.to_string()));
+        let out = agentsight().args(&full).output().expect("run agentsight");
+        assert!(
+            out.status.success(),
+            "{args:?} must be accepted; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("hotness --json must emit valid JSON");
+        let rankings = v["hotness"]["rankings"]
+            .as_array()
+            .expect("the report must carry the hotness rankings");
+        assert_eq!(rankings.len(), 1, "one skill was loaded: {v}");
+        rankings[0]["weekly_ranks"]
+            .as_array()
+            .expect("each skill carries its per-bucket ranks")
+            .iter()
+            .map(|rank| {
+                rank["iso_week"]
+                    .as_str()
+                    .expect("a bucket carries its label")
+                    .to_string()
+            })
+            .collect()
+    };
+
+    // Without the flag the published weekly grouping stays the default.
+    let weekly = bucket_labels(&[]);
+    assert_eq!(
+        weekly.len(),
+        1,
+        "two loads in one week stay one weekly bucket: {weekly:?}"
+    );
+    assert!(
+        weekly[0].contains("-W"),
+        "the weekly bucket label keeps its ISO-week spelling: {weekly:?}"
+    );
+
+    // Daily buckets are what the API and the dashboard already expose.
+    let daily = bucket_labels(&["--granularity", "day"]);
+    assert_eq!(
+        daily.len(),
+        2,
+        "two loads on two days must be two daily buckets: {daily:?}"
+    );
+    assert!(
+        daily.iter().all(|label| !label.contains("-W")),
+        "a daily bucket is labelled with its date, not an ISO week: {daily:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn skill_metrics_granularity_is_only_declared_where_it_buckets() {
+    // `granularity` buckets only the hotness trend, so the subcommands
+    // without one do not declare it: the flag is not advertised where it
+    // would have to be refused. `structopt` then answers "Found argument
+    // '--granularity' which wasn't expected" — a usage error pointing at the
+    // real problem, not a silently dropped parameter like the API's own
+    // pre-fix behaviour. Reverting the declaration removal would make this
+    // pass the flag through and print buckets nobody asked for.
+    let dir = fixture_dir("skill_hotness_granularity_scope");
+    let db = skill_loads_on_two_days(&dir);
+
+    for subcommand in ["downloads", "loads", "usage-ratio", "distribution"] {
+        let out = agentsight()
+            .args([
+                "skill-metrics",
+                subcommand,
+                "--db",
+                db.to_str().unwrap(),
+                "--granularity",
+                "day",
+                "--json",
+            ])
+            .output()
+            .expect("run agentsight");
+        assert!(
+            !out.status.success(),
+            "{subcommand} has no hotness trend; granularity must be refused there"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("--granularity") && err.contains("wasn't expected"),
+            "{subcommand} must reject the unknown flag: {err}"
+        );
+    }
+
+    // An unknown value is rejected rather than silently served as weekly —
+    // the same closed set the API validates against.
+    let out = agentsight()
+        .args([
+            "skill-metrics",
+            "hotness",
+            "--db",
+            db.to_str().unwrap(),
+            "--granularity",
+            "dayy",
+            "--json",
+        ])
+        .output()
+        .expect("run agentsight");
+    assert!(
+        !out.status.success(),
+        "an unknown granularity must be refused"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("day") && err.contains("week"),
+        "the error must list the valid values: {err}"
+    );
+
+    // `all` computes the hotness trend, so it accepts the flag too.
+    let out = agentsight()
+        .args([
+            "skill-metrics",
+            "all",
+            "--db",
+            db.to_str().unwrap(),
+            "--granularity",
+            "day",
+            "--json",
+        ])
+        .output()
+        .expect("run agentsight");
+    assert!(
+        out.status.success(),
+        "`all` computes the hotness trend, so it must accept the flag; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

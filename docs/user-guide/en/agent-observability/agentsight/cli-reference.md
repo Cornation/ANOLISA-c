@@ -12,7 +12,7 @@ it is a real capture.
 |---|---|
 | Privileges | `trace` needs root (or `CAP_BPF` + `CAP_PERFMON`). Query commands need read access to `/var/log/sysak/.agentsight`, which the packaged service owns — use `sudo`. |
 | Config file | Commands that read rules accept `--config`, default `/etc/agentsight/config.json`. `discover` reads the same file `trace` does, so it reflects your custom rules. |
-| Data location | Fixed at `/var/log/sysak/.agentsight`. `serve`, `dashboard`, `skill-metrics`, `audit`, `metrics`, `summary`, and `interruption` accept `--db` to point at a different database file. |
+| Data location | Fixed at `/var/log/sysak/.agentsight`. `serve`, `dashboard`, `skill-metrics`, `audit`, `metrics`, `summary`, `interruption`, and `token` accept `--db` to point at a different database file. |
 | Machine output | `--json` is available on `discover`, `token`, `metrics`, `audit`, `summary`, `interruption *`, and `skill-metrics *`. |
 | Output language | `summary`, `metrics`, and `interruption` print English; `discover` and `token` print Chinese regardless of locale. Use `--json` for stable, language-neutral text. |
 | Platform | On macOS only `trace` (trajectory collector) and `serve` exist. |
@@ -158,6 +158,7 @@ One-command health picture for a recent window.
 FLAGS:
         --json                          Output as JSON
 OPTIONS:
+        --agent <agent>                 Scope the session and interruption totals to one agent
         --db <db>                       Override the sessions database path
         --last <last>                   Query the last N hours (default: 24) [default: 24]
         --tokenless-db <tokenless-db>   Override the tokenless stats database path
@@ -190,6 +191,20 @@ the reading host's own data.
 agentsight summary --last 24 --db /backup/agentsight/genai_events.db
 ```
 
+`--agent` narrows the Sessions and Interruptions sections to one agent, and the two sections match
+the same way their own stores do. Sessions compare the label the session listing already resolves —
+the recorded agent name, falling back to the process name — while interrupts compare the
+`agent_name` column only, which is what `interruption list --agent` filters on. Both matches are
+case-insensitive. The heading and the JSON gain an `agent` key naming the scope; without the flag
+both sections cover every agent and the report keeps its previous shape.
+
+```bash
+agentsight summary --last 24 --agent CoshNG
+```
+
+Tokenless savings are recorded per session and carry no agent, so an agent-scoped report leaves
+that section out and says so rather than printing host-wide numbers beside agent-scoped totals.
+
 ## agentsight token
 
 Token consumption for a period, optionally compared with the previous one.
@@ -201,9 +216,18 @@ FLAGS:
 
 OPTIONS:
         --data-file <data-file>    Custom data file path
+        --db <db>                  Override the database path (same as --data-file)
         --hours <hours>            Query last N hours
         --period <period>          Query by fixed time period
                                    [possible values: today, yesterday, week, last_week, month, last_month]
+```
+
+`--db` is the same override every other query command spells that way; it was added after
+`--data-file`, which stays supported. Pass one or the other — giving both is a usage error.
+
+```bash
+# read a copy of the database instead of the default location
+agentsight token --db /backup/agentsight/agentsight.db --period week
 ```
 
 ```bash
@@ -415,8 +439,27 @@ OPTIONS:
         --last <last>            Query last N hours (default: 24) [default: 24]
 ```
 
-Both keep their existing scopes: `stats` reports the whole window (resolved and unresolved), and
-`count` reports unresolved events only. Without `--agent` they cover every agent on the host.
+`stats` additionally takes the `--unresolved` / `--resolved` pair, so the per-type table can
+answer "what is still open in this window" without also counting events someone already closed:
+
+```
+FLAGS:
+        --json          Output as JSON
+        --resolved      Count only resolved events
+        --unresolved    Count only unresolved events
+```
+
+```
+$ sudo agentsight interruption stats --last 168 --unresolved
+TYPE                 SEVERITY    COUNT
+----------------------------------------
+token_limit          medium          3
+llm_error            high            1
+```
+
+Without either flag `stats` keeps its previous scope and reports the whole window (resolved and
+unresolved); the two flags are mutually exclusive. `count` is unchanged and still reports
+unresolved events only. Without `--agent` both cover every agent on the host.
 
 ```bash
 $ sudo agentsight interruption list --last 24
@@ -464,7 +507,41 @@ sudo agentsight interruption count --last 24 --agent CoshNG
 # everything that hit one session, then close one event
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444
 sudo agentsight interruption resolve 11111111222222223333333344444444
+
+# only what is still open in that session
+sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --unresolved
+
+# only the token-limit hits in that session
+sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --type token_limit
 ```
+
+`session` and `conversation` take the same `--unresolved` / `--resolved` pair `list` and `stats`
+do, so a per-id view can be narrowed to the events still open (or already closed) without reading
+the `RESOLVED` column by eye. They also accept `list`'s `--type` and `--severity` filters, with the
+same closed value sets, so one session can be read down to its critical `agent_crash` rows without
+post-processing the `--json` array:
+
+```
+FLAGS:
+        --json          Output as JSON (one JSON array)
+        --resolved      Show only resolved events
+        --unresolved    Show only unresolved events
+
+OPTIONS:
+        --severity <severity>    [possible values: critical, high, medium, low]
+        --type <itype>           [possible values: agent_crash, rate_limit, auth_error,
+                                                   network_timeout, service_unavailable,
+                                                   safety_filter, sse_truncated, context_overflow,
+                                                   token_limit, llm_error, retry_storm, dead_loop,
+                                                   tool_failure, empty_response, resource_exhaustion,
+                                                   slow_response, state_machine_error,
+                                                   unauthorized_action]
+```
+
+The resolution pair stays mutually exclusive, and every filter defaults to off: without flags the
+command prints the id's whole history, as before. `--agent` is deliberately not part of these two
+views — the resolver derives a session from `(agent, pid, prompt)`, so one session already belongs
+to one agent. Scope by agent on `list`, `stats`, or `count` instead.
 
 > `--type` accepts every interruption type the detector can produce (the values are derived from
 > `InterruptionType::ALL`). `agentsight interruption list --help` prints the current list; the full
@@ -488,20 +565,81 @@ OPTIONS (all subcommands):
         --db <db>          Override database path
         --last <last>      Query last N hours (default: 168 = 7 days) [default: 168]
         --json             Output as JSON
+
+OPTIONS (all, hotness):
+        --granularity <granularity>    Bucket the hotness trend by day or week
+                                       [possible values: day, week] [default: week]
 ```
 
 ```bash
 sudo agentsight skill-metrics all --last 168
 sudo agentsight skill-metrics hotness --agent CoshNG --json
+
+# daily buckets instead of the weekly default
+sudo agentsight skill-metrics hotness --last 168 --granularity day
 ```
 
-The same numbers appear on the Dashboard's Skill Metrics page.
+The same numbers appear on the Dashboard's Skill Metrics page, which switches the same
+day/week granularity on its hotness chart. `--granularity` buckets only the hotness trend, so
+`all` and `hotness` accept it and the four metric-specific subcommands do not — passing it
+there is a usage error, the same refusal `GET /api/skill-metrics/downloads` and its siblings
+return. Without the flag the trend keeps its weekly buckets, and the text and JSON output are
+unchanged.
+
+## Export batch ATIF locally
+
+From `src/agentsight` in a source checkout:
+
+```bash
+python3 scripts/batch-analyze.py --file session.jsonl --export-atif ./atif-export --min-steps 1
+```
+
+`--export-atif DIRECTORY` writes the converted document without launching an analyzer
+or making model requests. It is mutually exclusive with `--dim`, and rejects `--binary`.
+Selection is shared with analysis: `--file`, repeatable `--dir`, `--limit` (default 10),
+and `--min-steps` (default 3). Directory scans keep the existing 1 KiB minimum file size
+and subagent exclusion; use `--file` to export a small file explicitly.
+
+Each name is the full SHA-256 of the canonical absolute source path followed by
+`.atif.json`. Same-name inputs in different directories remain distinct; exporting the
+same path again atomically replaces its previous artifact. Moving the source changes
+its artifact name. Existing unrelated destination files and source files are preserved.
+The directory is created on demand. Stdout emits one JSON record per exported file with
+`_atif_file`, `_source_file`, `_session_id`, and `_steps`.
+
+Exports use UTF-8 and the existing converter's filtering and truncation rules; they are
+not a lossless backup of raw logs. They contain conversation content, so keep them in a
+local directory intended for that data. Write failures are counted in stderr's summary,
+temporary files are removed, and later files are attempted. As in existing batch analysis,
+a completed batch returns 0 even if its summary includes per-file failures.
 
 ## Related pages
 
 - [Configuration](configuration.md) — what the config file controls
 - [Dashboard guide](dashboard.md) — UI equivalents of these queries
 - [Data and storage](data-and-storage.md) — HTTP API and database layout
+
+## Parallel batch analysis
+
+The source-checkout batch tool can run independent analyzer invocations concurrently.
+From `src/agentsight`, build the analyzer once and opt in to up to four workers:
+
+```bash
+cargo build -p agentsight-opt --bin analyze
+python3 scripts/batch-analyze.py --dir /path/to/sessions --dim perf --binary target/debug/analyze --jobs 4
+```
+
+`--jobs N` accepts 1 through 8 and defaults to 1. Both running invocations and outstanding
+work are bounded by N. Documents and per-file diagnostics are emitted in the original
+discovery order, even when later invocations finish first; this may delay visible output
+behind a slow earlier file. Each document retains its source/session metadata.
+
+Existing selection, minimum-step filtering, timeout, failure counters, exit behavior and
+temporary-file cleanup remain in effect. Prebuilding avoids concurrent Cargo build-lock
+contention. Full analysis still requires model credentials; choosing N above 1 may issue
+simultaneous paid requests and encounter endpoint rate limits. This reduces elapsed time
+for independent sessions where concurrency is available; it does not reduce per-request
+model latency, token use or prices.
 
 ## Benchmark artifacts
 

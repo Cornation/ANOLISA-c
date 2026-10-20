@@ -11,7 +11,7 @@
 |---|---|
 | 权限 | `trace` 需要 root（或 `CAP_BPF` + `CAP_PERFMON`）。查询类命令需要读取 `/var/log/sysak/.agentsight`，该目录归服务所有，请加 `sudo`。 |
 | 配置文件 | 需要读取规则的命令支持 `--config`，默认 `/etc/agentsight/config.json`。`discover` 读取与 `trace` 相同的文件，因此会反映你的自定义规则。 |
-| 数据位置 | 固定为 `/var/log/sysak/.agentsight`。`serve`、`dashboard`、`skill-metrics`、`audit`、`metrics`、`summary`、`interruption` 支持用 `--db` 指定其他数据库文件。 |
+| 数据位置 | 固定为 `/var/log/sysak/.agentsight`。`serve`、`dashboard`、`skill-metrics`、`audit`、`metrics`、`summary`、`interruption`、`token` 支持用 `--db` 指定其他数据库文件。 |
 | 机器可读输出 | `discover`、`token`、`metrics`、`audit`、`summary`、`interruption *`、`skill-metrics *` 都支持 `--json`。 |
 | 输出语言 | `summary`、`metrics`、`interruption` 输出英文；`discover`、`token` 无论 locale 都输出中文。需要稳定文本时请用 `--json`。 |
 | 平台 | macOS 上只有 `trace`（轨迹采集）和 `serve`。 |
@@ -150,6 +150,7 @@ AgentSight 仪表盘状态
 FLAGS:
         --json                          Output as JSON
 OPTIONS:
+        --agent <agent>                 Scope the session and interruption totals to one agent
         --db <db>                       Override the sessions database path
         --last <last>                   Query the last N hours (default: 24) [default: 24]
         --tokenless-db <tokenless-db>   Override the tokenless stats database path
@@ -180,6 +181,19 @@ Tokenless     10% saved (110.0K -> 99.0K, 20 ops)
 agentsight summary --last 24 --db /backup/agentsight/genai_events.db
 ```
 
+`--agent` 把 Sessions 与 Interruptions 两节收窄到单个 Agent，两节分别沿用各自存储的匹配口径：
+Sessions 比较会话列表本就解析出的标签——优先记录到的 Agent 名，缺省时回退到进程名；Interruptions
+只比较 `agent_name` 列，也就是 `interruption list --agent` 过滤的那一列。两者都大小写不敏感。
+带上它时标题与 JSON 会多出一个 `agent` 键标明范围；不带时两节覆盖所有 Agent，报告形状与之前
+完全一致。
+
+```bash
+agentsight summary --last 24 --agent CoshNG
+```
+
+Tokenless 节省量是按会话记录的、不带 Agent 归属，因此按 Agent 的报告不再输出该节，并明确说明，
+而不是把全主机的数字摆在按 Agent 的汇总旁边。
+
 ## agentsight token
 
 按周期查询 Token 消耗，可与上一周期对比。
@@ -191,9 +205,18 @@ FLAGS:
 
 OPTIONS:
         --data-file <data-file>    Custom data file path
+        --db <db>                  Override the database path (same as --data-file)
         --hours <hours>            Query last N hours
         --period <period>          Query by fixed time period
                                    [possible values: today, yesterday, week, last_week, month, last_month]
+```
+
+`--db` 与其余查询命令的库路径覆盖同名同义；它在 `--data-file` 之后加入，后者继续支持。两者只传
+一个，同时给出会报用法错误。
+
+```bash
+# 读取一份数据库副本，而不是默认位置
+agentsight token --db /backup/agentsight/agentsight.db --period week
 ```
 
 ```bash
@@ -401,8 +424,26 @@ OPTIONS:
         --last <last>            Query last N hours (default: 24) [default: 24]
 ```
 
-两者各自原有的统计口径不变：`stats` 统计整个窗口（含已解决与未解决），`count` 只统计未解决事件。
-不带 `--agent` 时覆盖主机上的所有 Agent。
+`stats` 另外接受 `--unresolved` / `--resolved` 这对参数，于是按类型的表可以只回答「这个窗口里
+还有多少未解决」，而不必把别人已经关掉的事件也算进去：
+
+```
+FLAGS:
+        --json          Output as JSON
+        --resolved      Count only resolved events
+        --unresolved    Count only unresolved events
+```
+
+```
+$ sudo agentsight interruption stats --last 168 --unresolved
+TYPE                 SEVERITY    COUNT
+----------------------------------------
+token_limit          medium          3
+llm_error            high            1
+```
+
+两个 flag 都不给时 `stats` 保持原有口径，统计整个窗口（含已解决与未解决）；两个 flag 互斥。
+`count` 不变，仍只统计未解决事件。不带 `--agent` 时两者都覆盖主机上的所有 Agent。
 
 ```bash
 $ sudo agentsight interruption list --last 24
@@ -450,7 +491,39 @@ sudo agentsight interruption count --last 24 --agent CoshNG
 # 查某个会话命中的全部中断，然后关闭其中一条
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444
 sudo agentsight interruption resolve 11111111222222223333333344444444
+
+# 只看该会话里仍未解决的中断
+sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --unresolved
+
+# 只看该会话里命中 token_limit 的中断
+sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --type token_limit
 ```
+
+`session` 与 `conversation` 接受和 `list`、`stats` 相同的 `--unresolved` / `--resolved` 这对参数，
+于是按 id 的视图可以只看仍未解决（或已关闭）的事件，不必用眼睛去读 `RESOLVED` 列。它们同样接受
+`list` 的 `--type` 与 `--severity` 过滤，取值集合一致，因此单个会话可以直接读到 critical 的
+`agent_crash` 那几行，不用再处理 `--json` 数组：
+
+```
+FLAGS:
+        --json          Output as JSON (one JSON array)
+        --resolved      Show only resolved events
+        --unresolved    Show only unresolved events
+
+OPTIONS:
+        --severity <severity>    [possible values: critical, high, medium, low]
+        --type <itype>           [possible values: agent_crash, rate_limit, auth_error,
+                                                   network_timeout, service_unavailable,
+                                                   safety_filter, sse_truncated, context_overflow,
+                                                   token_limit, llm_error, retry_storm, dead_loop,
+                                                   tool_failure, empty_response, resource_exhaustion,
+                                                   slow_response, state_machine_error,
+                                                   unauthorized_action]
+```
+
+解决状态那两个 flag 仍然互斥，所有过滤默认关闭：不带任何 flag 时照旧打印该 id 的全部历史。
+这两个视图有意不提供 `--agent`——解析器按 `(agent, pid, prompt)` 推导 session，一个 session 本身
+就只属于一个 Agent；按 Agent 过滤请用 `list`、`stats` 或 `count`。
 
 > `--type` 接受检测器能产出的所有中断类型（取值由 `InterruptionType::ALL` 派生）。
 > `agentsight interruption list --help` 会列出当前取值；带触发条件的完整清单见
@@ -474,20 +547,72 @@ OPTIONS（所有子命令通用）:
         --db <db>          Override database path
         --last <last>      Query last N hours (default: 168 = 7 days) [default: 168]
         --json             Output as JSON
+
+OPTIONS（all、hotness）:
+        --granularity <granularity>    按天或按周切分热度趋势
+                                       [possible values: day, week] [default: week]
 ```
 
 ```bash
 sudo agentsight skill-metrics all --last 168
 sudo agentsight skill-metrics hotness --agent CoshNG --json
+
+# 按天分桶，而不是默认的按周
+sudo agentsight skill-metrics hotness --last 168 --granularity day
 ```
 
-Dashboard 的 Skill 指标页展示的是同一批数字。
+Dashboard 的 Skill 指标页展示的是同一批数字，其热度图也支持同样的按天/按周切换。
+`--granularity` 只切分热度趋势，因此只有 `all` 和 `hotness` 接受它，四个单项指标子命令不接受——
+在那里传该参数是用法错误，与 `GET /api/skill-metrics/downloads` 等接口的拒绝行为一致。不给该参数时
+趋势仍按周分桶，文本与 JSON 输出保持不变。
+
+## 在本地批量导出 ATIF
+
+从源码仓库的 `src/agentsight` 目录运行：
+
+```bash
+python3 scripts/batch-analyze.py --file session.jsonl --export-atif ./atif-export --min-steps 1
+```
+
+`--export-atif DIRECTORY` 保存转换后的文档，不启动分析器，也不发起模型请求。
+它与 `--dim` 互斥，并拒绝 `--binary`。文件选择沿用分析模式：`--file`、可重复的
+`--dir`、`--limit`（默认 10）和 `--min-steps`（默认 3）。目录扫描仍要求文件至少
+1 KiB，并排除 subagent 文件；小文件可通过 `--file` 显式导出。
+
+文件名为源文件规范化绝对路径的完整 SHA-256 加 `.atif.json`。不同目录中的同名源文件
+不会混淆；再次导出同一路径会原子替换其旧产物。移动源文件后产物名会变化。
+源文件和目标目录中的其他文件保持不变，目标目录按需创建。标准输出按文件生成一行
+JSON 记录，包含 `_atif_file`、`_source_file`、`_session_id` 和 `_steps`。
+
+产物使用 UTF-8，沿用转换器已有的过滤和截断规则，不是原始日志的无损备份。
+产物包含会话内容，应放在适合保存这些数据的本地目录。写入失败会记入标准错误的
+汇总，清理临时文件后继续后续文件。与原有批量分析一致，批次处理结束时返回 0，
+即使汇总中有单个文件失败。
 
 ## 相关页面
 
 - [配置](configuration.md)——配置文件控制哪些行为
 - [Dashboard 指南](dashboard.md)——这些查询在界面上的等价操作
 - [数据与存储](data-and-storage.md)——HTTP API 与数据库结构
+
+## 并行批量分析
+
+源码仓库的批处理工具可以并行运行相互独立的分析器进程。
+从 `src/agentsight` 先构建分析器，再显式启用最多四个 worker：
+
+```bash
+cargo build -p agentsight-opt --bin analyze
+python3 scripts/batch-analyze.py --dir /path/to/sessions --dim perf --binary target/debug/analyze --jobs 4
+```
+
+`--jobs N` 接受 1 到 8，默认 1；运行中的调用和已提交但未输出的任务均不超过 N。
+即使后面的调用先完成，JSON 文档和逐文件诊断仍按原始发现顺序输出，因此较早的慢文件
+可能延后可见输出。每份文档仍保留源文件和会话元数据。
+
+文件选择、最少步骤过滤、超时、失败计数、退出行为和临时文件清理沿用原有规则。
+预先构建可避免多个 Cargo 调用争用构建锁。完整分析仍需要模型凭据；N 大于 1 时
+可能同时产生付费请求，并触发端点限流。该能力在允许并发的情况下缩短独立会话的
+批次耗时，不会降低单次模型延迟、Token 用量或单价。
 
 ## 基准测试产物
 

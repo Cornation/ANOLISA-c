@@ -324,7 +324,8 @@ impl AnalyzeChatmlCommand {
         // keyed by `index`: the function name arrives once (usually in the
         // first fragment) and the arguments stream as string fragments that
         // must be concatenated per index before rendering "name: arguments".
-        let mut tool_calls: Vec<(usize, String, String)> = Vec::new();
+        // The index is scoped to its choice, so the slot key carries both.
+        let mut tool_calls: Vec<((u64, usize), String, String)> = Vec::new();
         // Slot each choice's latest tool-call fragment landed in, so an
         // index-less continuation can extend the call that choice is holding
         // instead of folding it into slot 0.
@@ -357,6 +358,11 @@ impl AnalyzeChatmlCommand {
         // single replace-or-extend buffer rather than one entry per frame.
         let mut message_content = String::new();
         let mut message_reasoning = String::new();
+        // A refusal rides its own field (`delta.refusal` on a stream,
+        // `message.refusal` in a cumulative snapshot) while `content` stays
+        // null, so the content walks above never see it. The message parser
+        // and the token extractor both read it as the call's answer.
+        let mut message_refusal = String::new();
         // Responses closing events repeat the finalized answer. Like the
         // analyzer and the drain merger, use them only when no delta carried
         // text: a capture that attached after the deltas has them as its only
@@ -364,9 +370,18 @@ impl AnalyzeChatmlCommand {
         let mut saw_responses_text_delta = false;
         let mut saw_responses_reasoning_delta = false;
         let mut responses_closing_content: Option<String> = None;
-        let mut responses_closing_reasoning: Option<String> = None;
+        // Reasoning items carry different thinking rather than a repeat of
+        // one another (an agentic response interleaves one with each call it
+        // precedes), so they accumulate in arrival order instead of replacing.
+        let mut responses_closing_reasoning = String::new();
 
         /// Answer text of a closing `message` output item, or `None`.
+        ///
+        /// A refusal part keeps the answer in `refusal` rather than `text` —
+        /// the shape the message parser and the token extractor read. Without
+        /// it a capture that attached after the refusal deltas, whose only
+        /// copy of the answer is the closing item, still rendered an empty
+        /// response here.
         fn closing_message_item_text(chunk: &serde_json::Value) -> Option<String> {
             let item = chunk.get("item")?;
             if item.get("type").and_then(|t| t.as_str()) == Some("reasoning") {
@@ -376,7 +391,11 @@ impl AnalyzeChatmlCommand {
                 .get("content")?
                 .as_array()?
                 .iter()
-                .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+                .filter_map(|part| {
+                    part.get("text")
+                        .or_else(|| part.get("refusal"))
+                        .and_then(|t| t.as_str())
+                })
                 .collect();
             (!text.is_empty()).then_some(text)
         }
@@ -557,6 +576,40 @@ impl AnalyzeChatmlCommand {
                                 }
                             }
                         }
+                        // A refusal is the model's answer for that call and
+                        // arrives instead of a content delta, so it belongs in
+                        // the answer text — the same place the shared
+                        // aggregator and the live analyzer put it. Without
+                        // this arm a refusal-only turn rendered an empty
+                        // response while the message view showed the refusal.
+                        Some("response.refusal.delta") => {
+                            if let Some(delta) = data_json.get("delta").and_then(|v| v.as_str()) {
+                                if !delta.is_empty() {
+                                    // A refusal is answer text, so it counts
+                                    // as an answer delta: the closing events
+                                    // repeat it and must not be read again.
+                                    saw_responses_text_delta = true;
+                                    content_parts.push(delta.to_string());
+                                }
+                            }
+                        }
+                        // The closing event repeats the whole refusal and is
+                        // read only when no delta was captured — the same
+                        // delta-wins rule the aggregator applies. Like
+                        // `output_text.done` it is held as the closing answer,
+                        // so a later closing item that repeats it replaces it
+                        // instead of being counted next to it.
+                        Some("response.refusal.done") => {
+                            if content_parts.is_empty() {
+                                if let Some(refusal) =
+                                    data_json.get("refusal").and_then(|v| v.as_str())
+                                {
+                                    if !refusal.is_empty() {
+                                        responses_closing_content = Some(refusal.to_string());
+                                    }
+                                }
+                            }
+                        }
                         // Reasoning models stream their thinking on the
                         // same channel (dashscope qwen3-coder sends
                         // reasoning_text, the o-series summary_text); both
@@ -584,7 +637,7 @@ impl AnalyzeChatmlCommand {
                             }
                             if !saw_responses_reasoning_delta {
                                 if let Some(text) = closing_reasoning_item_text(&data_json) {
-                                    responses_closing_reasoning = Some(text);
+                                    responses_closing_reasoning.push_str(&text);
                                 }
                             }
                         }
@@ -646,6 +699,20 @@ impl AnalyzeChatmlCommand {
                                     }
                                 }
                             }
+                            // A refusal is the model's answer for the call and
+                            // arrives instead of content, so it belongs in the
+                            // answer text — where the message parser and the
+                            // token extractor put it. Without this the whole
+                            // answer of a refused call was dropped.
+                            if let Some(refusal) = payload.get("refusal").and_then(|v| v.as_str()) {
+                                if !refusal.is_empty() {
+                                    if cumulative {
+                                        accumulate(&mut message_refusal, refusal);
+                                    } else {
+                                        content_parts.push(refusal.to_string());
+                                    }
+                                }
+                            }
                             // Extract tool_calls - merge function name and
                             // streamed arguments fragments by index. A message
                             // snapshot carries the complete call, so it
@@ -681,14 +748,19 @@ impl AnalyzeChatmlCommand {
                                             } else {
                                                 tool_calls
                                                     .iter()
-                                                    .map(|(index, _, _)| *index)
+                                                    .filter(|((choice, _), _, _)| {
+                                                        *choice == choice_index
+                                                    })
+                                                    .map(|((_, index), _, _)| *index)
                                                     .max()
                                                     .map_or(0, |slot| slot.saturating_add(1))
                                             }
                                         }
                                     };
                                     current_tool_call_slot.insert(choice_index, index);
-                                    match tool_calls.iter_mut().find(|(i, _, _)| *i == index) {
+                                    match tool_calls.iter_mut().find(|((choice, slot), _, _)| {
+                                        *choice == choice_index && *slot == index
+                                    }) {
                                         Some((_, slot_name, slot_arguments)) => {
                                             if !name.is_empty() {
                                                 *slot_name = name.to_string();
@@ -701,7 +773,7 @@ impl AnalyzeChatmlCommand {
                                         }
                                         None => {
                                             tool_calls.push((
-                                                index,
+                                                (choice_index, index),
                                                 name.to_string(),
                                                 arguments.to_string(),
                                             ));
@@ -790,6 +862,13 @@ impl AnalyzeChatmlCommand {
             reasoning_parts.clear();
             reasoning_parts.push(message_reasoning);
         }
+        // A refusal snapshot is the whole answer of that snapshot form, so it
+        // supersedes any fragments captured alongside it, exactly as the
+        // content snapshot does.
+        if !message_refusal.is_empty() {
+            content_parts.clear();
+            content_parts.push(message_refusal);
+        }
 
         // A capture that attached after the deltas has the answer only in the
         // closing events; a complete capture already counted its deltas.
@@ -800,17 +879,13 @@ impl AnalyzeChatmlCommand {
                 }
             }
         }
-        if !saw_responses_reasoning_delta {
-            if let Some(text) = responses_closing_reasoning {
-                if !text.is_empty() {
-                    reasoning_parts.push(text);
-                }
-            }
+        if !saw_responses_reasoning_delta && !responses_closing_reasoning.is_empty() {
+            reasoning_parts.push(responses_closing_reasoning);
         }
 
         let mut tool_calls: Vec<String> = {
             let mut calls = tool_calls;
-            calls.sort_by_key(|(index, _, _)| *index);
+            calls.sort_by_key(|(key, _, _)| *key);
             calls
                 .into_iter()
                 .filter(|(_, name, arguments)| !name.is_empty() || !arguments.is_empty())
@@ -1310,6 +1385,31 @@ mod tests {
     }
 
     #[test]
+    fn sse_tool_calls_keep_choice_identity_apart() {
+        // OpenAI defines tool-call `index` per choice: both choices below
+        // start at index 0. Keying slots only by the wire index merged them
+        // into one call, replacing the first name and concatenating unrelated
+        // argument fragments.
+        let events = vec![
+            sse(
+                r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"first_tool","arguments":"{\"a\":1}"}}]}}]}"#,
+            ),
+            sse(
+                r#"{"choices":[{"index":1,"delta":{"tool_calls":[{"index":0,"function":{"name":"second_tool","arguments":"{\"b\":2}"}}]}}]}"#,
+            ),
+            sse("[DONE]"),
+        ];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&events);
+        assert_eq!(
+            resp.tool_calls,
+            vec![
+                r#"first_tool: {"a":1}"#.to_string(),
+                r#"second_tool: {"b":2}"#.to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn sse_unindexed_sequential_tool_calls_stay_separate() {
         // OpenAI's `index` is optional. A compatible gateway streams calls
         // without one, marking each new call by its non-empty function name;
@@ -1583,6 +1683,62 @@ mod tests {
         let resp = AnalyzeChatmlCommand::extract_response_from_sse(&only_reasoning);
         assert!(resp.content.is_empty());
         assert_eq!(resp.reasoning_content.as_deref(), Some("thought"));
+    }
+
+    /// An agentic Responses stream interleaves reasoning items with the calls
+    /// they precede, so one response can carry several of them: `reasoning`,
+    /// `function_call`, `reasoning`, `message`. A capture that attached after
+    /// both thinking deltas has only the closing `response.output_item.done`
+    /// events, and they carry different text. Keeping the last one counted
+    /// only the final block as reasoning, so the breakdown under-reported the
+    /// thinking the same capture delivered.
+    #[test]
+    fn sse_responses_keeps_every_closing_reasoning_item() {
+        let events = vec![
+            sse(
+                r#"{"type":"response.output_item.done","item":{"type":"reasoning","content":[{"type":"reasoning_text","text":"Check the logs. "}]}}"#,
+            ),
+            sse(
+                r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_010","name":"read_log"}}"#,
+            ),
+            sse(
+                r#"{"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"type":"summary_text","text":"Then retry."}]}}"#,
+            ),
+            sse(
+                r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"Done"}]}}"#,
+            ),
+            sse(r#"{"type":"response.completed","response":{"id":"resp_010"}}"#),
+        ];
+
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&events);
+        assert_eq!(resp.content, vec!["Done".to_string()]);
+        assert_eq!(
+            resp.reasoning_content.as_deref(),
+            Some("Check the logs. Then retry."),
+            "every closing reasoning item carries different thinking and must be kept"
+        );
+
+        // Accumulating the closing items must not weaken the delta-wins rule:
+        // when the thinking arrived as deltas, the closing items repeat it and
+        // are dropped whatever their number.
+        let with_deltas = vec![
+            sse(r#"{"type":"response.reasoning_text.delta","delta":"Check the logs. "}"#),
+            sse(r#"{"type":"response.reasoning_text.delta","delta":"Then retry."}"#),
+            sse(
+                r#"{"type":"response.output_item.done","item":{"type":"reasoning","content":[{"type":"reasoning_text","text":"Check the logs. "}]}}"#,
+            ),
+            sse(
+                r#"{"type":"response.output_item.done","item":{"type":"reasoning","content":[{"type":"reasoning_text","text":"Then retry."}]}}"#,
+            ),
+            sse(r#"{"type":"response.output_text.delta","delta":"Done"}"#),
+            sse(r#"{"type":"response.completed","response":{"id":"resp_011"}}"#),
+        ];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&with_deltas);
+        assert_eq!(
+            resp.reasoning_content.as_deref(),
+            Some("Check the logs. Then retry."),
+            "delivered deltas supersede every closing reasoning item"
+        );
     }
 
     /// The closing events replay what the deltas already delivered; a complete
@@ -2090,5 +2246,149 @@ mod tests {
             response_event.tokens, joined,
             "the response total must use the joined count"
         );
+    }
+    #[test]
+    fn sse_unindexed_tool_calls_are_allocated_within_their_choice() {
+        // Without a wire `index`, each choice owns its own growing slot
+        // sequence. Allocating from the global maximum interleaved the two
+        // choices' calls and made the output order depend on traffic from the
+        // other choice.
+        let events = vec![
+            sse(
+                r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"name":"a","arguments":"1"}}]}}]}"#,
+            ),
+            sse(
+                r#"{"choices":[{"index":1,"delta":{"tool_calls":[{"function":{"name":"b","arguments":"2"}}]}}]}"#,
+            ),
+            sse(
+                r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"name":"c","arguments":"3"}}]}}]}"#,
+            ),
+            sse("[DONE]"),
+        ];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&events);
+        assert_eq!(
+            resp.tool_calls,
+            vec!["a: 1".to_string(), "c: 3".to_string(), "b: 2".to_string()],
+            "calls stay grouped and ordered by their choice"
+        );
+    }
+
+    /// A refusal is the model's answer for the call: the Responses protocol
+    /// streams it on `response.refusal.delta` and closes it with
+    /// `response.refusal.done`, whose `refusal` field carries the finalized
+    /// text. The dispatch read neither, so a refusal-only capture rendered an
+    /// empty response in the token breakdown while the message view showed
+    /// the refusal.
+    #[test]
+    fn sse_responses_refusal_text_reaches_the_answer() {
+        let events = vec![
+            sse(r#"{"type":"response.created","response":{"id":"resp_1"}}"#),
+            sse(r#"{"type":"response.refusal.delta","delta":"I can't "}"#),
+            sse(r#"{"type":"response.refusal.delta","delta":"help with that."}"#),
+            sse(r#"{"type":"response.refusal.done","refusal":"I can't help with that."}"#),
+            sse(
+                r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}"#,
+            ),
+        ];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&events);
+        assert_eq!(resp.content, vec!["I can't ", "help with that."]);
+    }
+
+    /// A capture that joins after the deltas keeps the closing refusal, and a
+    /// stream that repeated both must not count the text twice.
+    #[test]
+    fn sse_responses_closing_refusal_fills_an_empty_answer() {
+        let only_done = vec![sse(
+            r#"{"type":"response.refusal.done","refusal":"I can't help with that."}"#,
+        )];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&only_done);
+        assert_eq!(resp.content, vec!["I can't help with that."]);
+    }
+
+    /// A refusal also arrives as a content part of the closing `message`
+    /// output item, typed `refusal` and carrying the text in `refusal` rather
+    /// than `text`. A capture that attached after the refusal deltas has this
+    /// part as its only copy of the answer, and the item reader took only the
+    /// `text` parts, so the response rendered empty.
+    #[test]
+    fn sse_responses_closing_item_refusal_part_fills_an_empty_answer() {
+        let only_item = vec![sse(
+            r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"refusal","refusal":"I can't help with that."}]}}"#,
+        )];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&only_item);
+        assert_eq!(resp.content, vec!["I can't help with that."]);
+    }
+
+    /// A capture that attached after the refusal deltas still sees both
+    /// closing events, `response.refusal.done` and then the closing item with
+    /// its refusal part. They carry the same answer, so it counts once.
+    #[test]
+    fn sse_responses_closing_refusal_and_item_count_once() {
+        let events = vec![
+            sse(r#"{"type":"response.refusal.done","refusal":"I can't help with that."}"#),
+            sse(
+                r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"refusal","refusal":"I can't help with that."}]}}"#,
+            ),
+        ];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&events);
+        assert_eq!(resp.content, vec!["I can't help with that."]);
+    }
+
+    /// The closing item repeats what the refusal deltas delivered; a complete
+    /// capture must count the answer once.
+    #[test]
+    fn sse_responses_closing_item_does_not_repeat_refusal_deltas() {
+        let events = vec![
+            sse(r#"{"type":"response.refusal.delta","delta":"I can't help with that."}"#),
+            sse(
+                r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"refusal","refusal":"I can't help with that."}]}}"#,
+            ),
+        ];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&events);
+        assert_eq!(resp.content, vec!["I can't help with that."]);
+    }
+
+    /// The chat-completions protocol carries a refusal in its own `refusal`
+    /// field, on `delta` for a stream and on `message` for a cumulative
+    /// snapshot, while `content` stays null. The dispatch read `content` and
+    /// `reasoning_content` but not `refusal`, so a refused call broke down as
+    /// an empty answer even though the message view showed the refusal.
+    #[test]
+    fn sse_chat_refusal_delta_reaches_the_answer() {
+        let events = vec![
+            sse(r#"{"choices":[{"index":0,"delta":{"refusal":"I can't "}}]}"#),
+            sse(r#"{"choices":[{"index":0,"delta":{"refusal":"help with that."}}]}"#),
+            sse("[DONE]"),
+        ];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&events);
+        assert_eq!(resp.content, vec!["I can't ", "help with that."]);
+    }
+
+    /// A cumulative `message` snapshot repeats the refusal so far; the final
+    /// snapshot is the answer and must not be counted once per frame.
+    #[test]
+    fn sse_chat_refusal_snapshot_is_not_accumulated_per_frame() {
+        let events = vec![
+            sse(
+                r#"{"choices":[{"index":0,"message":{"role":"assistant","refusal":"I can't help"}}]}"#,
+            ),
+            sse(
+                r#"{"choices":[{"index":0,"message":{"role":"assistant","refusal":"I can't help with that."}}]}"#,
+            ),
+            sse("[DONE]"),
+        ];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&events);
+        assert_eq!(resp.content, vec!["I can't help with that."]);
+    }
+
+    /// A message item mixes a `text` part and a `refusal` part; both belong
+    /// to the answer, in the order the item lists them.
+    #[test]
+    fn sse_responses_closing_item_reads_text_and_refusal_parts() {
+        let only_item = vec![sse(
+            r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"First. "},{"type":"refusal","refusal":"I can't help with that."}]}}"#,
+        )];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&only_item);
+        assert_eq!(resp.content, vec!["First. I can't help with that."]);
     }
 }

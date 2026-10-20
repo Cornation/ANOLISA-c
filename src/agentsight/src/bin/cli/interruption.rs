@@ -172,6 +172,7 @@ pub enum InterruptionAction {
     /// Example:
     ///   agentsight interruption stats --last 168
     ///   agentsight interruption stats --last 168 --agent qoder
+    ///   agentsight interruption stats --last 168 --unresolved
     Stats {
         /// Query last N hours (default: 24)
         #[structopt(long, default_value = "24")]
@@ -180,6 +181,14 @@ pub enum InterruptionAction {
         /// Filter by agent name (exact match)
         #[structopt(long)]
         agent: Option<String>,
+
+        /// Count only unresolved events
+        #[structopt(long, conflicts_with = "resolved")]
+        unresolved: bool,
+
+        /// Count only resolved events
+        #[structopt(long, conflicts_with = "unresolved")]
+        resolved: bool,
 
         /// Output as JSON
         #[structopt(long)]
@@ -209,13 +218,37 @@ pub enum InterruptionAction {
 
     /// List all interruption events for a specific session.
     ///
-    /// Returns events ordered by occurred_at_ns ascending.
+    /// Returns events ordered by occurred_at_ns ascending. Takes the same
+    /// `--type` and `--severity` row filters `list` does, so one session can be
+    /// narrowed without post-processing its `--json` array. There is no
+    /// `--agent` here: the resolver derives a session from `(agent, pid,
+    /// prompt)`, so one session already belongs to one agent.
     ///
     /// Example:
     ///   agentsight interruption session abc123-session-id
+    ///   agentsight interruption session abc123-session-id --unresolved
+    ///   agentsight interruption session abc123-session-id --type token_limit
     Session {
         /// The session_id to query
         session_id: String,
+
+        /// Filter by interruption type.
+        /// Accepts every type the detector can produce; see the values listed below.
+        #[structopt(long = "type", possible_values = interruption_type_values())]
+        itype: Option<String>,
+
+        /// Filter by severity level.
+        /// Values: critical, high, medium, low
+        #[structopt(long, possible_values = &["critical", "high", "medium", "low"])]
+        severity: Option<String>,
+
+        /// Show only unresolved events
+        #[structopt(long, conflicts_with = "resolved")]
+        unresolved: bool,
+
+        /// Show only resolved events
+        #[structopt(long, conflicts_with = "unresolved")]
+        resolved: bool,
 
         /// Output as JSON
         #[structopt(long)]
@@ -224,14 +257,34 @@ pub enum InterruptionAction {
 
     /// List all interruption events for a specific conversation.
     ///
-    /// Returns events ordered by occurred_at_ns ascending.
-    /// The conversation_id corresponds to a single agent conversation.
+    /// Returns events ordered by occurred_at_ns ascending. The conversation_id
+    /// corresponds to a single agent conversation, and the view takes the same
+    /// `--type` and `--severity` row filters `list` does.
     ///
     /// Example:
     ///   agentsight interruption conversation abc123-conversation-id
+    ///   agentsight interruption conversation abc123-conversation-id --severity high
     Conversation {
         /// The conversation_id to query
         conversation_id: String,
+
+        /// Filter by interruption type.
+        /// Accepts every type the detector can produce; see the values listed below.
+        #[structopt(long = "type", possible_values = interruption_type_values())]
+        itype: Option<String>,
+
+        /// Filter by severity level.
+        /// Values: critical, high, medium, low
+        #[structopt(long, possible_values = &["critical", "high", "medium", "low"])]
+        severity: Option<String>,
+
+        /// Show only unresolved events
+        #[structopt(long, conflicts_with = "resolved")]
+        unresolved: bool,
+
+        /// Show only resolved events
+        #[structopt(long, conflicts_with = "unresolved")]
+        resolved: bool,
 
         /// Output as JSON
         #[structopt(long)]
@@ -317,13 +370,7 @@ impl InterruptionCommand {
                 json,
             } => {
                 let (start_ns, end_ns) = time_range_ns(*last);
-                let resolved_filter = if *unresolved {
-                    Some(false)
-                } else if *resolved {
-                    Some(true)
-                } else {
-                    None
-                };
+                let resolved_filter = resolution_filter(*unresolved, *resolved);
 
                 match store.list(
                     start_ns,
@@ -369,9 +416,22 @@ impl InterruptionCommand {
                 }
             },
 
-            InterruptionAction::Stats { last, agent, json } => {
+            InterruptionAction::Stats {
+                last,
+                agent,
+                unresolved,
+                resolved,
+                json,
+            } => {
                 let (start_ns, end_ns) = time_range_ns(*last);
-                match interruption_stats(&store, start_ns, end_ns, agent.as_deref()) {
+                let resolved_filter = resolution_filter(*unresolved, *resolved);
+                match interruption_stats(
+                    &store,
+                    start_ns,
+                    end_ns,
+                    agent.as_deref(),
+                    resolved_filter,
+                ) {
                     Ok(stats) => {
                         if *json {
                             print_json(&stats);
@@ -435,9 +495,24 @@ impl InterruptionCommand {
                 }
             }
 
-            InterruptionAction::Session { session_id, json } => {
+            InterruptionAction::Session {
+                session_id,
+                itype,
+                severity,
+                unresolved,
+                resolved,
+                json,
+            } => {
+                let resolved_filter = resolution_filter(*unresolved, *resolved);
+                let row_filter = RowFilter {
+                    itype: itype.as_deref(),
+                    severity: severity.as_deref(),
+                    resolved: resolved_filter,
+                };
                 match store.list_by_session(session_id) {
                     Ok(rows) => {
+                        let rows: Vec<_> =
+                            rows.into_iter().filter(|r| row_filter.keeps(r)).collect();
                         if *json {
                             print_json(&rows);
                         } else {
@@ -459,26 +534,40 @@ impl InterruptionCommand {
 
             InterruptionAction::Conversation {
                 conversation_id,
+                itype,
+                severity,
+                unresolved,
+                resolved,
                 json,
-            } => match store.list_by_conversation(conversation_id) {
-                Ok(rows) => {
-                    if *json {
-                        print_json(&rows);
-                    } else {
-                        if rows.is_empty() {
-                            println!("No interruptions for conversation: {conversation_id}");
-                            return;
+            } => {
+                let resolved_filter = resolution_filter(*unresolved, *resolved);
+                let row_filter = RowFilter {
+                    itype: itype.as_deref(),
+                    severity: severity.as_deref(),
+                    resolved: resolved_filter,
+                };
+                match store.list_by_conversation(conversation_id) {
+                    Ok(rows) => {
+                        let rows: Vec<_> =
+                            rows.into_iter().filter(|r| row_filter.keeps(r)).collect();
+                        if *json {
+                            print_json(&rows);
+                        } else {
+                            if rows.is_empty() {
+                                println!("No interruptions for conversation: {conversation_id}");
+                                return;
+                            }
+                            println!("Interruptions for conversation {conversation_id}:");
+                            println!();
+                            print_records_table(&rows);
                         }
-                        println!("Interruptions for conversation {conversation_id}:");
-                        println!();
-                        print_records_table(&rows);
+                    }
+                    Err(e) => {
+                        eprintln!("Query error: {e}");
+                        std::process::exit(1);
                     }
                 }
-                Err(e) => {
-                    eprintln!("Query error: {e}");
-                    std::process::exit(1);
-                }
-            },
+            }
 
             InterruptionAction::Resolve { interruption_id } => {
                 match store.resolve(interruption_id) {
@@ -501,17 +590,70 @@ impl InterruptionCommand {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Resolve the `--unresolved` / `--resolved` pair into a store filter.
+///
+/// `None` means "every event in the window", which stays the default for
+/// `list` and `stats`; the flags are declared mutually exclusive, so at most
+/// one of them is set.
+fn resolution_filter(unresolved: bool, resolved: bool) -> Option<bool> {
+    if unresolved {
+        Some(false)
+    } else if resolved {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// The row filters the per-id views apply on top of their store call.
+///
+/// `list_by_session` / `list_by_conversation` take an id and nothing else, so
+/// the two views narrow the rows the store already returned. `list` sends the
+/// same three filters to SQL; keeping them in one predicate here is what makes
+/// the per-id views agree with it instead of each re-deriving the rule (the
+/// separation of the two arms is how `--resolved` first drifted from `list`).
+#[derive(Clone, Copy)]
+struct RowFilter<'a> {
+    /// `--type`; the concrete type string the store column holds.
+    itype: Option<&'a str>,
+    /// `--severity`; one of critical/high/medium/low.
+    severity: Option<&'a str>,
+    /// `--unresolved` / `--resolved`; `None` keeps both.
+    resolved: Option<bool>,
+}
+
+impl RowFilter<'_> {
+    /// Whether one record survives every filter that was asked for.
+    fn keeps(&self, record: &InterruptionRecord) -> bool {
+        self.itype
+            .is_none_or(|itype| record.interruption_type == itype)
+            && self
+                .severity
+                .is_none_or(|severity| record.severity == severity)
+            && self.resolved.is_none_or(|state| record.resolved == state)
+    }
+
+    /// How many of `records` survive; the arms and their tests share it so the
+    /// two cannot disagree about what "kept" means.
+    #[cfg(test)]
+    fn keeps_each(&self, records: &[InterruptionRecord]) -> usize {
+        records.iter().filter(|record| self.keeps(record)).count()
+    }
+}
+
 /// Per-(type, severity) counts for a window, optionally scoped to one agent.
 ///
-/// `resolved` stays `None`: the CLI reports what happened in the window,
-/// resolved or not, unlike the dashboard's unresolved-only card.
+/// `resolved` stays `None` unless `--unresolved` / `--resolved` asks
+/// otherwise: the CLI reports what happened in the window, resolved or not,
+/// unlike the dashboard's unresolved-only card.
 fn interruption_stats(
     store: &InterruptionStore,
     start_ns: i64,
     end_ns: i64,
     agent: Option<&str>,
+    resolved: Option<bool>,
 ) -> Result<Vec<agentsight::storage::sqlite::InterruptionTypeStat>, Box<dyn std::error::Error>> {
-    store.stats(start_ns, end_ns, None, agent)
+    store.stats(start_ns, end_ns, resolved, agent)
 }
 
 /// Unresolved per-severity counts for a window, optionally scoped to one agent.
@@ -808,5 +950,325 @@ mod tests {
         let (s2, e2) = time_range_ns(24);
         assert!(s2 < e2);
         assert_eq!(e2 - s2, 24 * 3600 * 1_000_000_000);
+    }
+
+    /// A read-only store holding one resolved and one unresolved interruption.
+    fn stats_store(name: &str) -> (InterruptionStore, std::path::PathBuf) {
+        use agentsight::interruption::{InterruptionEvent, InterruptionType, Severity};
+
+        let path = std::env::temp_dir().join(format!(
+            "agentsight_interruption_stats_{name}_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = InterruptionStore::new_with_path(&path).expect("create store");
+        for (index, resolved) in [false, true].into_iter().enumerate() {
+            let mut event = InterruptionEvent::new(
+                InterruptionType::LlmError,
+                Some(format!("sess-{index}")),
+                None,
+                Some(format!("conv-{index}")),
+                None,
+                Some(4242),
+                Some("TestAgent".to_string()),
+                1_000_000_000,
+                None,
+            );
+            event.severity = Severity::High;
+            event.resolved = resolved;
+            store.insert(&event).expect("insert event");
+        }
+        let read_only =
+            InterruptionStore::open_read_only_existing(&path).expect("reopen read-only");
+        (read_only, path)
+    }
+
+    /// `--unresolved` / `--resolved` on `stats` used to be unexpressible: the
+    /// helper passed `None` for the resolution filter no matter what, so the
+    /// per-type table always mixed solved and unsolved events. The store has
+    /// accepted the filter all along; only the CLI wiring was missing.
+    #[test]
+    fn stats_honours_the_resolution_filters() {
+        let (store, path) = stats_store("resolution");
+        let (start_ns, end_ns) = (0, i64::MAX);
+
+        let unresolved = interruption_stats(&store, start_ns, end_ns, None, Some(false))
+            .expect("unresolved stats");
+        assert_eq!(
+            unresolved.iter().map(|s| s.count).sum::<i64>(),
+            1,
+            "--unresolved must leave out the resolved event: {unresolved:?}"
+        );
+
+        let resolved =
+            interruption_stats(&store, start_ns, end_ns, None, Some(true)).expect("resolved stats");
+        assert_eq!(
+            resolved.iter().map(|s| s.count).sum::<i64>(),
+            1,
+            "--resolved must leave out the unresolved event: {resolved:?}"
+        );
+
+        // Without either flag both events still count, as before.
+        let all = interruption_stats(&store, start_ns, end_ns, None, None).expect("all stats");
+        assert_eq!(all.iter().map(|s| s.count).sum::<i64>(), 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stats_parses_the_resolution_flags_exclusively() {
+        let unresolved =
+            InterruptionCommand::from_iter_safe(["interruption", "stats", "--unresolved"])
+                .expect("--unresolved parses");
+        match unresolved.action {
+            InterruptionAction::Stats {
+                unresolved,
+                resolved,
+                ..
+            } => {
+                assert!(unresolved);
+                assert!(!resolved);
+            }
+            other => panic!("expected Stats, got {other:?}"),
+        }
+
+        let resolved = InterruptionCommand::from_iter_safe(["interruption", "stats", "--resolved"])
+            .expect("--resolved parses");
+        match resolved.action {
+            InterruptionAction::Stats {
+                unresolved,
+                resolved,
+                ..
+            } => {
+                assert!(!unresolved);
+                assert!(resolved);
+            }
+            other => panic!("expected Stats, got {other:?}"),
+        }
+
+        // The siblings `list` already rejects both flags together; `stats`
+        // must not silently pick one.
+        let both = InterruptionCommand::from_iter_safe([
+            "interruption",
+            "stats",
+            "--unresolved",
+            "--resolved",
+        ]);
+        assert!(both.is_err(), "the two flags are mutually exclusive");
+    }
+
+    /// `session` and `conversation` are the two per-id views, and like `list`
+    /// and `stats` they used to print every event for the id — a reader
+    /// checking whether a session still had anything open had to eyeball the
+    /// RESOLVED column. The store's `list_by_session` / `list_by_conversation`
+    /// take no filter, so the CLI narrows the rows it already returned.
+    #[test]
+    fn session_and_conversation_filter_by_resolution_state() {
+        use agentsight::interruption::{InterruptionEvent, InterruptionType, Severity};
+
+        let path = std::env::temp_dir().join(format!(
+            "agentsight_interruption_session_filter_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = InterruptionStore::new_with_path(&path).expect("create store");
+        for (index, resolved) in [false, true].into_iter().enumerate() {
+            let mut event = InterruptionEvent::new(
+                InterruptionType::LlmError,
+                Some("sess-shared".to_string()),
+                None,
+                Some("conv-shared".to_string()),
+                None,
+                Some(4242),
+                Some("TestAgent".to_string()),
+                1_000_000_000,
+                None,
+            );
+            event.severity = Severity::High;
+            event.resolved = resolved;
+            event.interruption_id = format!("int-session-filter-{index}");
+            store.insert(&event).expect("insert event");
+        }
+
+        let by_session = store.list_by_session("sess-shared").expect("session rows");
+        assert_eq!(by_session.len(), 2, "the store returns both states");
+
+        // The arms narrow with `RowFilter`; reverting it to an
+        // unconditional keep makes these counts 2.
+        let keep = |rows: &[InterruptionRecord], want: Option<bool>| -> usize {
+            RowFilter {
+                itype: None,
+                severity: None,
+                resolved: want,
+            }
+            .keeps_each(rows)
+        };
+        assert_eq!(keep(&by_session, Some(false)), 1, "--unresolved");
+        assert_eq!(keep(&by_session, Some(true)), 1, "--resolved");
+
+        let by_conversation = store
+            .list_by_conversation("conv-shared")
+            .expect("conversation rows");
+        assert_eq!(by_conversation.len(), 2);
+        assert_eq!(keep(&by_conversation, Some(false)), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `--type` and `--severity` are the other two row filters `list` applies,
+    /// and the per-id views rejected them: `session <id> --severity high` was a
+    /// usage error, so narrowing one session to its critical events meant
+    /// dumping `--json` and filtering by hand. Each filter is asserted on its
+    /// own and together, so a dropped dimension cannot pass on the other's
+    /// evidence.
+    #[test]
+    fn session_and_conversation_filter_by_type_and_severity() {
+        use agentsight::interruption::{InterruptionEvent, InterruptionType, Severity};
+
+        let path = std::env::temp_dir().join(format!(
+            "agentsight_interruption_session_row_filter_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = InterruptionStore::new_with_path(&path).expect("create store");
+        for (index, (itype, severity)) in [
+            (InterruptionType::LlmError, Severity::High),
+            (InterruptionType::TokenLimit, Severity::Medium),
+            (InterruptionType::AgentCrash, Severity::Critical),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut event = InterruptionEvent::new(
+                itype,
+                Some("sess-rows".to_string()),
+                None,
+                Some("conv-rows".to_string()),
+                None,
+                Some(4242),
+                Some("TestAgent".to_string()),
+                1_000_000_000,
+                None,
+            );
+            event.severity = severity;
+            event.interruption_id = format!("int-row-filter-{index}");
+            store.insert(&event).expect("insert event");
+        }
+
+        let rows = store.list_by_session("sess-rows").expect("session rows");
+        assert_eq!(rows.len(), 3, "the store returns every type and severity");
+        let kept = |itype: Option<&str>, severity: Option<&str>| -> usize {
+            RowFilter {
+                itype,
+                severity,
+                resolved: None,
+            }
+            .keeps_each(&rows)
+        };
+
+        // Each filter alone.
+        assert_eq!(kept(Some("token_limit"), None), 1, "--type");
+        assert_eq!(kept(None, Some("high")), 1, "--severity");
+        // An unmatched value yields nothing instead of falling back to all
+        // rows, the same contract `list` has.
+        assert_eq!(kept(Some("dead_loop"), None), 0, "unknown type");
+        assert_eq!(kept(None, Some("low")), 0, "absent severity");
+        // Both together intersect rather than union.
+        assert_eq!(kept(Some("llm_error"), Some("high")), 1);
+        assert_eq!(
+            kept(Some("llm_error"), Some("critical")),
+            0,
+            "a row must satisfy every filter that was asked for"
+        );
+        // No filter still keeps every row.
+        assert_eq!(kept(None, None), 3);
+
+        let by_conversation = store.list_by_conversation("conv-rows").expect("conv rows");
+        assert_eq!(
+            RowFilter {
+                itype: Some("agent_crash"),
+                severity: Some("critical"),
+                resolved: None,
+            }
+            .keeps_each(&by_conversation),
+            1,
+            "the conversation arm shares the predicate"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Both flags parse on the two per-id subcommands and stay exclusive.
+    #[test]
+    fn session_and_conversation_parse_the_resolution_flags() {
+        for command in ["session", "conversation"] {
+            let one = InterruptionCommand::from_iter_safe([
+                "interruption",
+                command,
+                "abc",
+                "--unresolved",
+            ])
+            .unwrap_or_else(|e| panic!("{command} --unresolved must parse: {e}"));
+            match one.action {
+                InterruptionAction::Session { unresolved, .. }
+                | InterruptionAction::Conversation { unresolved, .. } => assert!(unresolved),
+                other => panic!("unexpected action {other:?}"),
+            }
+
+            let both = InterruptionCommand::from_iter_safe([
+                "interruption",
+                command,
+                "abc",
+                "--unresolved",
+                "--resolved",
+            ]);
+            assert!(both.is_err(), "{command} must reject both flags together");
+        }
+    }
+
+    /// The per-id views accept the `--type` / `--severity` pair `list` does,
+    /// with the same closed value sets. A typo has to be a usage error rather
+    /// than a silently ignored filter, which is the contract `list` already
+    /// enforces through `possible_values`.
+    #[test]
+    fn session_and_conversation_parse_the_type_and_severity_filters() {
+        for command in ["session", "conversation"] {
+            let parsed = InterruptionCommand::from_iter_safe([
+                "interruption",
+                command,
+                "abc",
+                "--type",
+                "token_limit",
+                "--severity",
+                "medium",
+            ])
+            .unwrap_or_else(|e| panic!("{command} --type/--severity must parse: {e}"));
+            match parsed.action {
+                InterruptionAction::Session {
+                    itype, severity, ..
+                }
+                | InterruptionAction::Conversation {
+                    itype, severity, ..
+                } => {
+                    assert_eq!(itype.as_deref(), Some("token_limit"));
+                    assert_eq!(severity.as_deref(), Some("medium"));
+                }
+                other => panic!("unexpected action {other:?}"),
+            }
+
+            for (flag, bad) in [("--type", "not_a_type"), ("--severity", "urgent")] {
+                let rejected = InterruptionCommand::from_iter_safe([
+                    "interruption",
+                    command,
+                    "abc",
+                    flag,
+                    bad,
+                ]);
+                assert!(
+                    rejected.is_err(),
+                    "{command} {flag} {bad} must be rejected, like list's"
+                );
+            }
+        }
     }
 }
