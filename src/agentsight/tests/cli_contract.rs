@@ -897,6 +897,45 @@ fn interruption_stats_scopes_to_the_requested_agent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn skill_load_timestamps(now_ns: i64) -> [i64; 2] {
+    use chrono::Datelike;
+
+    let day_ns = 86_400_000_000_000_i64;
+    let yesterday = now_ns.div_euclid(day_ns) * day_ns - day_ns;
+    // A Monday needs the preceding Sunday so its pair stays in one ISO week.
+    let second =
+        if chrono::DateTime::from_timestamp_nanos(yesterday).weekday() == chrono::Weekday::Mon {
+            yesterday - day_ns
+        } else {
+            yesterday
+        };
+    [second - day_ns, second]
+}
+
+#[test]
+fn skill_load_fixture_stays_in_one_week_across_calendar_boundaries() {
+    let day_ns = 86_400_000_000_000_i64;
+    for year in 2024..=2027 {
+        for ordinal in 1..=366 {
+            let Some(day) = chrono::NaiveDate::from_yo_opt(year, ordinal) else {
+                continue;
+            };
+            let now = day.and_hms_opt(12, 0, 0).unwrap().and_utc();
+            let now_ns = now.timestamp_nanos_opt().unwrap();
+            let [first, second] = skill_load_timestamps(now_ns);
+            let first_day = chrono::DateTime::from_timestamp_nanos(first).date_naive();
+            let second_day = chrono::DateTime::from_timestamp_nanos(second).date_naive();
+            use chrono::Datelike;
+            assert_eq!(first_day.iso_week(), second_day.iso_week(), "today={day}");
+            assert_eq!(second - first, day_ns, "today={day}");
+            assert!(
+                second < now_ns && now_ns - first < 4 * day_ns,
+                "today={day}"
+            );
+        }
+    }
+}
+
 /// A genai database holding two SKILL.md loads of one skill on two different
 /// days inside the same ISO week, so the `--last` window holds both.
 fn skill_loads_on_two_days(dir: &std::path::Path) -> PathBuf {
@@ -908,11 +947,7 @@ fn skill_loads_on_two_days(dir: &std::path::Path) -> PathBuf {
     .expect("create genai store");
     drop(store);
 
-    // Two consecutive days, both inside the same ISO week (2026-03-03 is a
-    // Tuesday, 2026-03-04 a Wednesday).
-    let day_ns = 86_400_000_000_000_i64;
-    let first_ns = now_ns() - 2 * day_ns;
-    let second_ns = now_ns() - day_ns;
+    let [first_ns, second_ns] = skill_load_timestamps(now_ns());
 
     let output_messages =
         serde_json::to_string(&vec![agentsight::genai::semantic::OutputMessage {
