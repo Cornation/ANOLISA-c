@@ -117,9 +117,11 @@ def summarize_load(path: Path | None) -> dict[str, Any]:
     return result
 
 
-def summarize_resources(path: Path | None) -> dict[str, dict[str, float | None]]:
+def summarize_resources(
+    path: Path | None, *, rows: list[dict[str, str]] | None = None
+) -> dict[str, dict[str, float | None]]:
     """Keep point statistics, deriving trends only from a valid elapsed timeline."""
-    rows = metric_rows(path)
+    rows = metric_rows(path) if rows is None else rows
     clock = (
         "monotonic_timestamp" if any("monotonic_timestamp" in row for row in rows) else "timestamp"
     )
@@ -167,10 +169,12 @@ def qps_sort_key(value: str) -> tuple[bool, float, str]:
     return (number is None, number if number is not None else 0, value)
 
 
-def summarize_qps_resources(path: Path | None) -> dict[str, Any]:
+def summarize_qps_resources(
+    path: Path | None, *, rows: list[dict[str, str]] | None = None
+) -> dict[str, Any]:
     """Group CPU and RSS samples by the input QPS recorded in the CSV."""
     grouped: dict[str, dict[str, Any]] = {}
-    for row in metric_rows(path):
+    for row in metric_rows(path) if rows is None else rows:
         key = qps_key(row.get("input_qps"))
         group = grouped.setdefault(key, {"samples": 0, "cpu_pct": [], "rss_mb": []})
         group["samples"] += 1
@@ -204,11 +208,11 @@ def counter_delta(values: list[float]) -> int:
 
 
 def summarize_drops(
-    path: Path | None, load_requests: int
+    path: Path | None, load_requests: int, *, rows: list[dict[str, str]] | None = None
 ) -> dict[str, int | float | None]:
     """Summarize dropped events and derive a measurable drop rate."""
     values = {name: [] for name in DROP_METRICS}
-    for row in metric_rows(path):
+    for row in metric_rows(path) if rows is None else rows:
         for name in DROP_METRICS:
             value = numeric(row.get(name))
             if value is not None:
@@ -562,15 +566,18 @@ def main() -> int:
         else summarize_load(args.load_results)
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    resources = summarize_resources(args.metrics)
-    drops = summarize_drops(args.metrics, load["requests"])
+    rows = metric_rows(args.metrics)
+    resources = summarize_resources(args.metrics, rows=rows)
+    drops = summarize_drops(args.metrics, load["requests"], rows=rows)
+    qps_resources = summarize_qps_resources(args.metrics, rows=rows)
+    del rows
     report = render_markdown(
         protocol=args.protocol,
         qps=args.qps,
         duration=args.duration,
         load=load,
         resources=resources,
-        qps_resources=summarize_qps_resources(args.metrics),
+        qps_resources=qps_resources,
         drops=drops,
         validation=validation,
         load_artifact=args.load_results,
