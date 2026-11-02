@@ -171,6 +171,8 @@ def _entries_to_atif(entries: Iterable[dict], filepath: Path) -> Optional[dict]:
     session_id = filepath.stem
     agent_name = "unknown"
     model_name = None
+    runtime_identity = {}
+    message_identity = {}
     # Only known Qoder sources use partial accounting. Unidentified exports
     # retain the existing snapshot convention for backward compatibility.
     partial_usage = ".qoder" in filepath.parts or ".qoderwork" in filepath.parts
@@ -186,6 +188,10 @@ def _entries_to_atif(entries: Iterable[dict], filepath: Path) -> Optional[dict]:
 
         # Detect agent name from runtime-config
         if entry_type == "runtime-config":
+            for field in ("sessionId", "version", "entrypoint"):
+                value = entry.get(field)
+                if isinstance(value, str) and value:
+                    runtime_identity.setdefault(field, value)
             model_name = entry.get("model")
             entrypoint = entry.get("entrypoint")
             if entrypoint in ("qoder", "qoderwork", "claude-code"):
@@ -203,6 +209,12 @@ def _entries_to_atif(entries: Iterable[dict], filepath: Path) -> Optional[dict]:
         role = msg.get("role", entry_type)
         content = msg.get("content", "")
         timestamp = entry.get("timestamp")
+
+        if role in ("user", "assistant"):
+            for field in ("sessionId", "version"):
+                value = entry.get(field)
+                if isinstance(value, str) and value:
+                    message_identity.setdefault(field, value)
 
         # Detect model from assistant messages
         if role == "assistant" and msg.get("model"):
@@ -311,12 +323,20 @@ def _entries_to_atif(entries: Iterable[dict], filepath: Path) -> Optional[dict]:
     elif ".qoder" in path_str:
         agent_name = "qoder"
 
+    # Runtime metadata is authoritative even when it follows message records.
+    # Copied transcripts keep their recorded identity rather than their new name.
+    session_id = (
+        runtime_identity.get("sessionId") or message_identity.get("sessionId") or session_id
+    )
+    agent_name = runtime_identity.get("entrypoint") or agent_name
+    agent_version = runtime_identity.get("version") or message_identity.get("version") or ""
+
     return {
         "schema_version": "ATIF-v1.7",
         "session_id": session_id,
         "agent": {
             "name": agent_name,
-            "version": "",
+            "version": agent_version,
             "model_name": model_name,
         },
         "steps": steps,
