@@ -685,8 +685,10 @@ The directory is created on demand. Stdout emits one JSON record per exported fi
 Exports use UTF-8 and the existing converter's filtering and truncation rules; they are
 not a lossless backup of raw logs. They contain conversation content, so keep them in a
 local directory intended for that data. Write failures are counted in stderr's summary,
-temporary files are removed, and later files are attempted. As in existing batch analysis,
-a completed batch returns 0 even if its summary includes per-file failures.
+temporary files are removed, and later files are attempted. Both export and analysis
+return 1 after completing the batch if any operation was counted as failed. A batch
+with only successful or skipped files returns 0. Parse/minimum-step skips retain their
+existing classification; inspect stderr's summary to distinguish them from successes.
 
 ## Related pages
 
@@ -709,8 +711,9 @@ work are bounded by N. Documents and per-file diagnostics are emitted in the ori
 discovery order, even when later invocations finish first; this may delay visible output
 behind a slow earlier file. Each document retains its source/session metadata.
 
-Existing selection, minimum-step filtering, timeout, failure counters, exit behavior and
-temporary-file cleanup remain in effect. Prebuilding avoids concurrent Cargo build-lock
+Selection, minimum-step filtering, timeout, failure counters and temporary-file cleanup
+remain in effect. A failed operation makes the final exit status 1 without preventing
+later files from being processed. Prebuilding avoids concurrent Cargo build-lock
 contention. Full analysis still requires model credentials; choosing N above 1 may issue
 simultaneous paid requests and encounter endpoint rate limits. This reduces elapsed time
 for independent sessions where concurrency is available; it does not reduce per-request

@@ -568,6 +568,7 @@ For resource-constrained environments, disable non-essential features and reduce
 ## ATIF export
 
 Use `scripts/batch-analyze.py --export-atif DIRECTORY` to save converted Claude/Qoder ATIF locally without invoking an analyzer.
+Batch export and analysis return exit status 1 if any operation fails, after processing the remaining files; successful or skipped-only batches return 0.
 See the [CLI reference](../../docs/user-guide/en/agentsight/cli-reference.md) for usage and limits.
 
 ## Supported LLM Providers

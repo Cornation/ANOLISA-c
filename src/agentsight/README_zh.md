@@ -551,6 +551,7 @@ AgentSight 通过 `agentsight.json` 配置文件进行统一管理（默认路�
 ## ATIF 导出
 
 使用 `scripts/batch-analyze.py --export-atif DIRECTORY` 可在本地保存转换后的 Claude/Qoder ATIF，无需启动分析器。
+批量导出和分析在处理完剩余文件后，只要有操作失败就返回退出码 1；只有成功或跳过的批次返回 0。
 用法和限制见 [CLI 参考](../../docs/user-guide/zh/agentsight/cli-reference.md)。
 
 ## 支持的 LLM 提供商
