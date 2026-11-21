@@ -97,18 +97,38 @@ test('a rejected clipboard write falls back once and removes its textarea', asyn
   assert.equal(completions, 1);
 });
 
-test('the fallback retains legacy feedback when execCommand reports failure', (t) => {
+test('a rejected fallback must not report a completed copy', (t) => {
   const state = browser(t, { execCommand: () => false });
   let completions = 0;
   copyText('session-1', () => { completions += 1; });
-  assert.equal(completions, 1);
+  assert.equal(completions, 0);
   assert.deepEqual(state.children, []);
 });
 
-test('the fallback retains legacy cleanup and feedback if execCommand throws', (t) => {
+test('a throwing fallback cleans up without reporting a completed copy', (t) => {
   const state = browser(t, { execCommand: () => { throw new Error('copy unsupported'); } });
   let completions = 0;
   copyText('session-1', () => { completions += 1; });
+  assert.equal(completions, 0);
+  assert.deepEqual(state.children, []);
+});
+
+test('both denied copy methods leave feedback unchanged and allow retry', async (t) => {
+  let allowed = false;
+  const state = browser(t, {
+    writeText: () => Promise.reject(new Error('permission denied')),
+    execCommand: () => allowed,
+  });
+  let completions = 0;
+  const done = () => { completions += 1; };
+  copyText('optimization prompt', done);
+  await new Promise(setImmediate);
+  assert.equal(completions, 0);
+  assert.deepEqual(state.children, []);
+  allowed = true;
+  copyText('optimization prompt', done);
+  await new Promise(setImmediate);
   assert.equal(completions, 1);
+  assert.deepEqual(state.copies, ['optimization prompt', 'optimization prompt']);
   assert.deepEqual(state.children, []);
 });

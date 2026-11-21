@@ -8,9 +8,11 @@ function fallbackCopy(text: string, done: () => void) {
   document.body.appendChild(el);
   el.focus();
   el.select();
-  try { document.execCommand('copy'); } catch {}
+  let copied = false;
+  try { copied = document.execCommand('copy'); } catch {}
   document.body.removeChild(el);
-  done();
+  // Browsers can refuse both APIs; only a completed write earns "Copied".
+  if (copied) done();
 }
 
 /** Copy text, falling back to execCommand in insecure HTTP contexts. */
