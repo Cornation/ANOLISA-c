@@ -83,7 +83,10 @@ export const SkillMetricsPage: React.FC = () => {
     const endNs = endMs * 1_000_000;
     fetchAgentNames(startNs, endNs)
       .then((names) => {
-        if (!cancelled) setAgents(names);
+        if (cancelled) return;
+        setAgents(names);
+        // A removed option must not survive as an invisible query filter.
+        setAgentName((current) => names.includes(current) ? current : '');
       })
       .catch(() => {});
     return () => {

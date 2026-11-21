@@ -676,6 +676,39 @@ test('skill metrics: an older range agent list must not overwrite the newer rang
     'the older range response must not overwrite the newer range agent list');
 });
 
+for (const available of [['beta'], [], ['alpha', 'beta']]) {
+  test(`skill metrics: range options reconcile the selected agent (${available.join(',')})`, async () => {
+    const { calls, stubs } = deferredFetchStubs(['fetchSkillMetrics', 'fetchAgentNames']);
+    const driver = createHooksDriver();
+    const page = loadPageModule('src/pages/SkillMetricsPage.tsx', {
+      '../i18n': { useI18n: () => ({ t: (key) => key }) },
+      recharts: {
+        ...componentStub('BarChart'), ...componentStub('Bar'), ...componentStub('XAxis'),
+        ...componentStub('YAxis'), ...componentStub('Tooltip'), ...componentStub('ResponsiveContainer'),
+      },
+      '../utils/apiClient': stubs,
+      '../components/DateTimePicker': componentStub('DateTimePicker'),
+    }, driver).SkillMetricsPage;
+    let rendered = driver.render(page);
+    rendered.effects[1]();
+    calls.fetchAgentNames[0].resolve(['alpha']);
+    await settle();
+    driver.slots[2].setter('alpha');
+    driver.slots[0].setter(1000);
+    driver.slots[1].setter(2000);
+    rendered = driver.render(page);
+    rendered.effects[1]();
+    calls.fetchAgentNames[1].resolve(available);
+    await settle();
+    const expected = available.includes('alpha') ? 'alpha' : '';
+    assert.equal(driver.slots[2].value, expected);
+    // The query must use the option the selector can actually display.
+    rendered = driver.render(page);
+    rendered.effects[0]();
+    assert.equal(calls.fetchSkillMetrics[0].args[2], expected || undefined);
+  });
+}
+
 test('skill metrics: a failed reload must not keep the previous report', async () => {
   const { calls, stubs } = deferredFetchStubs(['fetchSkillMetrics', 'fetchAgentNames']);
   const driver = createHooksDriver();
