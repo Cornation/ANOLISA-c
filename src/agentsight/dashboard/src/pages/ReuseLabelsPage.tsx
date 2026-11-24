@@ -113,9 +113,11 @@ export const ReuseLabelsPage: React.FC = () => {
   labelFilterRef.current = labelFilter;
   const stateFilterRef = useRef(stateFilter);
   stateFilterRef.current = stateFilter;
+  const loadPendingRef = useRef(false);
 
   const load = useCallback(async () => {
     const requestId = ++loadRequestIdRef.current;
+    loadPendingRef.current = true;
     setLoading(true);
     setError(null);
     try {
@@ -135,6 +137,7 @@ export const ReuseLabelsPage: React.FC = () => {
       }
     } finally {
       if (requestId === loadRequestIdRef.current) {
+        loadPendingRef.current = false;
         setLoading(false);
       }
     }
@@ -160,6 +163,10 @@ export const ReuseLabelsPage: React.FC = () => {
   /** Keep matching rows in place, and remove decisions outside the current
    * queue from both the list and its selection. */
   const replaceRow = (updated: SessionLabelView) => {
+    // A filter read started before this acknowledgement may still contain
+    // the old verdict. Replace that read with one observing the committed
+    // decision; otherwise it can undo the local update below.
+    if (loadPendingRef.current) void load();
     const matches = (!labelFilterRef.current || updated.effective_label === labelFilterRef.current)
       && (!stateFilterRef.current || updated.confirm_state === stateFilterRef.current);
     setRows((current) =>

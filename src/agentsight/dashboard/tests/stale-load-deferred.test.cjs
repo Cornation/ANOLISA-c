@@ -196,6 +196,58 @@ async function renderReuseReview(label = '', state = '') {
   return { driver, page, calls, original, button };
 }
 
+for (const action of ['confirm', 'rejudge']) {
+  for (const outcome of ['success', 'failure']) {
+    test(`reuse ${action}: a pre-acknowledgement filter read cannot replace the decision (${outcome})`, async () => {
+      const { driver, page, calls, original, button } = await renderReuseReview();
+      const pending = button(action === 'confirm' ? 'reuse.confirm' : 'reuse.rejudge').props.onClick();
+      // A filter remains editable while the mutation is in flight.
+      const tree = driver.render(page).element;
+      const filter = findElement(tree, (node) => node.type === 'select'
+        && elementText(node).join('').includes('unknown'));
+      assert.ok(filter && !filter.props.disabled);
+      filter.props.onChange({ target: { value: 'unknown' } });
+      driver.render(page).effects[0]();
+      const stale = calls.fetchReuseSessions[1];
+      const updated = { ...original, human_backed: true, confirm_state: 'confirmed', llm_label: 'good' };
+      if (action === 'confirm') calls.decideReuseLabel[0].resolve(updated);
+      else {
+        calls.runReuseJudgements[0].resolve({ examined: 1, judged: 1 });
+        await settle();
+        calls.fetchReuseSessions[2].resolve({ sessions: [updated] });
+      }
+      await pending;
+      const fresh = calls.fetchReuseSessions[action === 'confirm' ? 2 : 3];
+      if (fresh) {
+        assert.equal(fresh.args[0].label, 'unknown', 'refresh keeps the current filter');
+        fresh.resolve({ sessions: [updated] });
+        await settle();
+      }
+      if (outcome === 'success') stale.resolve({ sessions: [original] });
+      else stale.reject(new Error('obsolete list failure'));
+      await settle();
+      assert.deepEqual(driver.slots[0].value, [updated]);
+      assert.equal(driver.slots[4].value, false, 'no stuck loading indicator');
+      assert.equal(driver.slots[7].value, null, 'obsolete failure stays invisible');
+    });
+  }
+}
+
+test('a rejected reuse decision does not retire a valid filter read', async () => {
+  const { driver, page, calls, original, button } = await renderReuseReview();
+  const pending = button('reuse.confirm').props.onClick();
+  driver.slots[1].setter('unknown');
+  driver.render(page).effects[0]();
+  calls.decideReuseLabel[0].reject(new Error('decision rejected'));
+  await pending;
+  assert.equal(calls.fetchReuseSessions.length, 2);
+  calls.fetchReuseSessions[1].resolve({ sessions: [original] });
+  await settle();
+  assert.deepEqual(driver.slots[0].value, [original]);
+  assert.equal(driver.slots[4].value, false);
+  assert.equal(driver.slots[7].value, 'decision rejected');
+});
+
 for (const scenario of [
   { name: 'confirm-state filter', label: '', state: 'unconfirmed', action: 'reuse.confirm',
     update: { confirm_state: 'confirmed', human_backed: true } },
