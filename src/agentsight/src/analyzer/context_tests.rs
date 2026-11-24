@@ -123,6 +123,73 @@ fn build(results: &[AnalysisResult]) -> Value {
     value
 }
 
+fn captured_partial_response(prefix: &[u8]) -> AggregatedResult {
+    let body = json!({"model":"fixture","input":"report usage","stream":true}).to_string();
+    let request = format!(
+        "POST /v1/responses HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut aggregator = Aggregator::with_limits(
+        4,
+        &RuntimeLimits {
+            retain_raw_sse: true,
+            ..Default::default()
+        },
+    );
+    let parser = Parser::new();
+    for (rw, bytes) in [
+        (1, request.as_bytes()),
+        (
+            0,
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n".as_slice(),
+        ),
+        (
+            0,
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n".as_slice(),
+        ),
+        (0, prefix),
+    ] {
+        assert!(
+            aggregator
+                .process_result(parser.parse_event(event(rw, bytes)))
+                .is_empty()
+        );
+    }
+    // Stopping capture can leave a terminal event incomplete. Use the same
+    // drain as shutdown rather than manufacturing a continuation buffer.
+    let mut results = aggregator.drain_pending();
+    assert_eq!(results.len(), 1);
+    assert!(!aggregator.has_pending());
+    results.pop().unwrap()
+}
+
+#[test]
+fn partial_usage_boundaries_ignore_schema_examples_in_captured_responses() {
+    let result = captured_partial_response(br#"data: {"type":"response.completed","response":{"tools":[{"type":"function","name":"report","parameters":{"type":"object","properties":{"sample":{"default":{"input_tokens":9000,"output_tokens":8000,"cached_tokens":7000}}}}}],"usage":{"input_tokens":57,"output_tokens":3,"input_tokens_details":{"cached_tokens":2}},"metadata":{"cut":"unfinished"#);
+    let analyses = Analyzer::new().analyze_aggregated(&result);
+    let record = analyses
+        .iter()
+        .find_map(|item| match item {
+            AnalysisResult::Token(record) => Some(record),
+            _ => None,
+        })
+        .expect("recovered usage");
+    assert_eq!((record.input_tokens, record.output_tokens), (57, 3));
+    assert_eq!(record.cache_read_tokens, Some(2));
+}
+
+#[test]
+fn partial_usage_boundaries_do_not_invent_usage_before_the_usage_block_arrives() {
+    let result = captured_partial_response(br#"data: {"type":"response.completed","response":{"tools":[{"type":"function","name":"report","parameters":{"default":{"usage":{"input_tokens":9000,"output_tokens":8000}}}}],"metadata":{"cut":"unfinished"#);
+    let analyses = Analyzer::new().analyze_aggregated(&result);
+    assert!(
+        !analyses
+            .iter()
+            .any(|item| matches!(item, AnalysisResult::Token(_))),
+        "schema defaults are not billed usage"
+    );
+}
+
 #[test]
 fn resource_abandonments_skip_body_analysis_and_preserve_metadata_for_every_delivery_path() {
     use crate::aggregator::RemoveReason;

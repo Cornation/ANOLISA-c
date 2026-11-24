@@ -21,6 +21,8 @@
 //! }
 //! ```
 
+mod partial;
+
 use super::{LLMProvider, TokenUsage, detect_provider_from_usage, extract_usage_object};
 use crate::parser::sse::ParsedSseEvent;
 
@@ -94,39 +96,11 @@ impl TokenParser {
         None
     }
 
-    /// Recover token usage fields from a possibly-truncated JSON string by
-    /// scanning for the integer values that follow `"input_tokens"`,
-    /// `"output_tokens"`, etc. The first *numeric* occurrence wins, which
-    /// matches dashscope's behaviour of placing the canonical `usage` block
-    /// before any `x_details` echo.
-    ///
-    /// A non-numeric occurrence is skipped: a committed Responses payload
-    /// echoes the request's `tools` before `usage`, so a tool parameter
-    /// named `input_tokens` appears there as an object schema. Stopping at
-    /// it lost the real count that followed.
+    // Keep the existing provider/counter aliases, but admit numbers only
+    // from usage objects rather than arbitrary data echoed by the provider.
     fn scan_partial_usage(data: &str) -> Option<TokenUsage> {
-        fn find_u64(s: &str, key: &str) -> Option<u64> {
-            let pat = format!("\"{key}\"");
-            let mut search_from = 0usize;
-            while let Some(relative) = s.get(search_from..)?.find(&pat) {
-                let idx = search_from + relative + pat.len();
-                search_from = idx;
-                let rest = s.get(idx..)?.trim_start();
-                let Some(rest) = rest.strip_prefix(':').map(str::trim_start) else {
-                    continue;
-                };
-                let end = rest
-                    .find(|c: char| !c.is_ascii_digit())
-                    .unwrap_or(rest.len());
-                if end == 0 {
-                    continue;
-                }
-                if let Ok(value) = rest[..end].parse::<u64>() {
-                    return Some(value);
-                }
-            }
-            None
-        }
+        let counters = partial::counters(data);
+        let find_u64 = |key: &str| counters.get(key).copied();
 
         // Gemini's wire counters are camelCase (`promptTokenCount` /
         // `candidatesTokenCount` under `usageMetadata`); the snake_case
@@ -135,11 +109,11 @@ impl TokenParser {
         // order. A gateway that spells them snake_case is the reason
         // `detect_provider_from_usage` reads `prompt_token_count` as the
         // Gemini signal.
-        let tool_prompt = find_u64(data, "toolUsePromptTokenCount")
-            .or_else(|| find_u64(data, "tool_use_prompt_token_count"))
+        let tool_prompt = find_u64("toolUsePromptTokenCount")
+            .or_else(|| find_u64("tool_use_prompt_token_count"))
             .unwrap_or(0);
-        let gemini_input = find_u64(data, "promptTokenCount")
-            .or_else(|| find_u64(data, "prompt_token_count"))
+        let gemini_input = find_u64("promptTokenCount")
+            .or_else(|| find_u64("prompt_token_count"))
             .map(|prompt| prompt.saturating_add(tool_prompt));
         // Thinking models report the reasoning budget in a counter of its
         // own, outside `candidatesTokenCount`, while `totalTokenCount`
@@ -148,28 +122,27 @@ impl TokenParser {
         // the same way or a thinking-model chunk split across TLS records
         // under-reports the call by the whole budget: 1 output token where
         // the same payload parsed whole reports 816.
-        let thoughts =
-            find_u64(data, "thoughtsTokenCount").or_else(|| find_u64(data, "thoughts_token_count"));
-        let gemini_output = find_u64(data, "candidatesTokenCount")
-            .or_else(|| find_u64(data, "candidates_token_count"))
+        let thoughts = find_u64("thoughtsTokenCount").or_else(|| find_u64("thoughts_token_count"));
+        let gemini_output = find_u64("candidatesTokenCount")
+            .or_else(|| find_u64("candidates_token_count"))
             .map(|candidates| candidates.saturating_add(thoughts.unwrap_or(0)))
             .or(thoughts);
         let is_gemini = gemini_input.is_some() || gemini_output.is_some();
-        let input = find_u64(data, "input_tokens")
-            .or_else(|| find_u64(data, "prompt_tokens"))
+        let input = find_u64("input_tokens")
+            .or_else(|| find_u64("prompt_tokens"))
             .or(gemini_input);
-        let output = find_u64(data, "output_tokens")
-            .or_else(|| find_u64(data, "completion_tokens"))
+        let output = find_u64("output_tokens")
+            .or_else(|| find_u64("completion_tokens"))
             .or(gemini_output);
         if input.is_none() && output.is_none() {
             return None;
         }
 
-        let cache_creation_input_tokens = find_u64(data, "cache_creation_input_tokens");
-        let anthropic_cache_read = find_u64(data, "cache_read_input_tokens");
+        let cache_creation_input_tokens = find_u64("cache_creation_input_tokens");
+        let anthropic_cache_read = find_u64("cache_read_input_tokens");
         let cache_read_input_tokens = anthropic_cache_read
-            .or_else(|| find_u64(data, "cached_tokens"))
-            .or_else(|| find_u64(data, "cachedContentTokenCount"));
+            .or_else(|| find_u64("cached_tokens"))
+            .or_else(|| find_u64("cachedContentTokenCount"));
         // Provider decides whether the cache counters are billed on top of the
         // input count (Anthropic) or sit inside it (OpenAI-compatible). The
         // cache field names alone are not enough: DashScope's compatible mode
@@ -182,7 +155,7 @@ impl TokenParser {
         // carry the Gemini label and never fall into the Anthropic inference.
         let provider = if is_gemini {
             LLMProvider::Gemini
-        } else if find_u64(data, "prompt_tokens").is_none()
+        } else if find_u64("prompt_tokens").is_none()
             && (cache_creation_input_tokens.is_some() || anthropic_cache_read.is_some())
         {
             LLMProvider::Anthropic
